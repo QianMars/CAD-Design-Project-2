@@ -23,7 +23,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    SolveOutput S = solve(P, 20.0);  // hard limit is 60 s per test case
+    // Time budget (hard limit is 60 s per test case). CBI_TIME overrides it for experiments.
+    double timeLimit = 40.0;
+    if (const char* e = std::getenv("CBI_TIME")) timeLimit = std::atof(e);
+    SolveOutput S = solve(P, timeLimit);
     if (!S.ok) {
         std::cerr << "Error: no legal clock tree found\n";
         return 2;
