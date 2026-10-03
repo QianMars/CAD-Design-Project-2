@@ -40,7 +40,7 @@ make
 | `src/main.cpp` | 命令列入口 |
 
 ## 演算法摘要
-1. **初始合法解**:候選方案包含「SRC 直接連所有 sink」,以及「由下往上的二分法分群」(嘗試多種群組大小上限)。每群放置一個最便宜且可行的 buffer,位置取群內座標中位數,並調整到未被佔用的整數座標;若 SRC 的長度限制不足,則插入中繼 buffer。從合法候選中選出 Score 最低者。
+1. **初始合法解**:候選方案包含「SRC 直接連所有 sink」,以及「由下往上的二分法分群」(嘗試多種群組大小上限)。每群放置一個最便宜且可行的 buffer,位置取群內座標中位數,並調整到未被佔用的整數座標;若 SRC 的長度限制不足,則插入中繼 buffer。另有「最近鄰分群」候選(小/中型輸入,或二分法找不到合法解時使用)。若某層完全無法合併(例如 buffer 可驅動距離極短),則在每個節點前插入一個往 SRC 方向前進的中繼 buffer,讓節點逐步靠攏後再合併。從合法候選中選出 Score 最低者。
 2. **貪婪局部搜尋**(時間預算的前 25%):移除 buffer、移動 buffer。
 3. **模擬退火**(至預算的 92%):隨機移動包含「移動 buffer」「把節點重新分配給別的父節點」「交換兩個 sink 的父節點」「在同層節點上方插入 buffer」「移除 buffer」。溫度依實際經過時間指數下降,起始溫度由隨機試探的 |ΔScore| 平均值決定。
 4. **最終貪婪微調**,使用剩餘時間。
@@ -52,6 +52,7 @@ make
 ## 輔助腳本(繳交時不需要)
 ```sh
 python3 scripts/gen_random.py N SEED W_SKEW > inputs/input002.cbi   # 產生隨機測資
+python3 scripts/gen_extreme.py CASE N SEED > x.cbi                    # 極端測資(tinysrc/srcf1/shortlib/dense/normal/big)
 python3 scripts/check.py input.cbi output.cbi                       # 獨立檢查器
 sh scripts/run_all.sh                                               # 編譯、批次執行並驗證
 sh scripts/make_submit.sh B11215061                                 # 產生繳交用 zip

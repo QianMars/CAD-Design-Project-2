@@ -53,6 +53,7 @@ struct Builder {
     std::vector<int> parent;
     std::vector<Buffer> bufs;
     std::set<std::pair<int, int>> occ;
+    int mode = 0;  // 0 = bisection grouping, 1 = nearest-neighbour grouping
 
     Builder(const Problem& p, int c) : P(p), n((int)p.sinks.size()), cap(c) {
         pts.push_back(P.src);
@@ -177,11 +178,71 @@ struct Builder {
         return false;
     }
 
+    // Can one buffer (placed at the median, before snapping) drive group g?
+    bool feasibleGroup(const std::vector<int>& g) const {
+        if (g.size() == 1) return true;
+        std::vector<int> xs, ys;
+        for (int id : g) { xs.push_back(pts[id].x); ys.push_back(pts[id].y); }
+        std::sort(xs.begin(), xs.end());
+        std::sort(ys.begin(), ys.end());
+        Point m{xs[xs.size() / 2], ys[ys.size() / 2]};
+        return cheapestType(P, (int)g.size(), lenSum(m, g)) >= 0;
+    }
+
+    // Greedy nearest-neighbour grouping: seed = node farthest from SRC, then add
+    // the closest remaining nodes while one buffer can still drive the group.
+    void nnGroups(const std::vector<int>& ids, int limit, std::vector<std::vector<int>>& out) const {
+        std::vector<int> rem = ids;
+        while (!rem.empty()) {
+            size_t si = 0;
+            int sd = -1;
+            for (size_t i = 0; i < rem.size(); ++i) {
+                int d = manhattan(P.src, pts[rem[i]]);
+                if (d > sd) { sd = d; si = i; }
+            }
+            int seed = rem[si];
+            rem.erase(rem.begin() + si);
+            std::sort(rem.begin(), rem.end(), [&](int a, int b) {
+                return manhattan(pts[seed], pts[a]) < manhattan(pts[seed], pts[b]);
+            });
+            std::vector<int> g{seed};
+            size_t taken = 0;
+            while (taken < rem.size() && (int)g.size() < limit) {
+                g.push_back(rem[taken]);
+                if (!feasibleGroup(g)) { g.pop_back(); break; }
+                ++taken;
+            }
+            rem.erase(rem.begin(), rem.begin() + taken);
+            out.push_back(g);
+        }
+    }
+
+    // Fallback when no grouping is possible: put a relay buffer in front of every
+    // node, one hop toward SRC. Nodes converge toward SRC, where they can merge.
+    bool advanceAll(std::vector<int>& cur) {
+        bool any = false;
+        for (size_t i = 0; i < cur.size(); ++i) {
+            int s = cur[i];
+            int d = manhattan(P.src, pts[s]);
+            if (d <= 1) continue;
+            int t = (int)std::min<long long>(maxL, d - 1);
+            Point pos;
+            if (!freeSpot(stepToward(pts[s], P.src, t), pos)) continue;
+            int dKid = manhattan(pos, pts[s]);
+            if (manhattan(P.src, pos) >= d) continue;
+            int ty = cheapestType(P, 1, dKid);
+            if (ty < 0) continue;
+            cur[i] = create(pos, ty, {s});
+            any = true;
+        }
+        return any;
+    }
+
     bool build(Tree& T) {
         if (P.srcFanout < 1 || cap < 2) return false;
         std::vector<int> cur;
         for (int i = 1; i <= n; ++i) cur.push_back(i);
-        for (int iter = 0; iter < 200; ++iter) {
+        for (int iter = 0; iter < 5000; ++iter) {
             if ((int)cur.size() <= P.srcFanout) {
                 if (srcLen(cur) <= P.srcLength || relayRepair(cur)) {
                     for (int c : cur) parent[c] = 0;
@@ -192,10 +253,15 @@ struct Builder {
             }
             if (cur.size() < 2) return false;
             std::vector<std::vector<int>> groups;
-            bisect(cur, cap, groups);
+            if (mode == 1) nnGroups(cur, cap, groups);
+            else bisect(cur, cap, groups);
             std::vector<int> nxt;
             for (auto& g : groups) makeGroup(g, nxt);
-            if (nxt.size() >= cur.size()) return false;  // no progress
+            if (nxt.size() >= cur.size()) {
+                // no grouping possible: advance every node toward SRC, then retry
+                if (!advanceAll(cur)) return false;
+                continue;
+            }
             cur = nxt;
         }
         return false;
@@ -524,16 +590,34 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
     direct.parent[0] = -1;
     consider(direct, "candidate: direct SRC->sinks");
 
-    // Candidates: clustering with different group-size caps.
+    // Candidates: clustering with different group-size caps (two grouping modes).
     std::set<int> caps;
     int maxF = 0;
     for (auto& t : P.lib) { caps.insert(t.fanout); maxF = std::max(maxF, t.fanout); }
     for (int c = 2; c <= std::min(maxF, 16); ++c) caps.insert(c);
+    const auto solveStart = Clock::now();
+    auto overBudget = [&](double f) {
+        return Clock::now() > solveStart + std::chrono::milliseconds((long long)(timeLimitSec * f * 1000));
+    };
     for (int c : caps) {
         if (c < 2) continue;
+        if (have && overBudget(0.25)) break;  // keep stage 1 cheap on huge inputs
         Builder b(P, c);
         Tree T;
         if (b.build(T)) consider(T, "candidate: bisect cap=" + std::to_string(c));
+    }
+    // Nearest-neighbour grouping is O(N^2): use it on small/medium inputs, or as a
+    // rescue when bisection found nothing legal.
+    if (n <= 1500 || !have) {
+        std::set<int> nnCaps;
+        for (auto& t : P.lib) if (t.fanout >= 2) nnCaps.insert(t.fanout);
+        for (int c : nnCaps) {
+            if (have && overBudget(0.30)) break;
+            Builder b(P, c);
+            b.mode = 1;
+            Tree T;
+            if (b.build(T)) consider(T, "candidate: nn-greedy cap=" + std::to_string(c));
+        }
     }
 
     if (!have) {

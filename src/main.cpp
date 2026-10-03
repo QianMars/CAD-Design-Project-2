@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <set>
 #include <string>
 
 #include "evaluator.h"
@@ -26,9 +27,24 @@ int main(int argc, char** argv) {
     // Time budget (hard limit is 60 s per test case). CBI_TIME overrides it for experiments.
     double timeLimit = 40.0;
     if (const char* e = std::getenv("CBI_TIME")) timeLimit = std::atof(e);
+    {
+        std::set<std::pair<int, int>> seen;
+        seen.insert({P.src.x, P.src.y});
+        for (const auto& q : P.sinks)
+            if (!seen.insert({q.x, q.y}).second) {
+                std::cerr << "Warning: input has duplicate coordinates; no legal tree can exist\n";
+                break;
+            }
+    }
     SolveOutput S = solve(P, timeLimit);
     if (!S.ok) {
         std::cerr << "Error: no legal clock tree found\n";
+        // Last resort: still write a file (SRC drives every sink) so the output exists.
+        Tree fallback;
+        fallback.parent.assign(P.sinks.size() + 1, 0);
+        fallback.parent[0] = -1;
+        std::string werr;
+        writeTree(argv[2], P, fallback, werr);
         return 2;
     }
     if (!writeTree(argv[2], P, S.tree, err)) {
