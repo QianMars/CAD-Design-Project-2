@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <set>
 #include <unordered_set>
@@ -315,93 +317,338 @@ bool movePass(const Problem& P, Tree& T, EvalResult& best, const Clock::time_poi
 
 
 // ---------------------------------------------------------------------------
-// Fast O(N) evaluation used inside simulated annealing.
-// Re-types every buffer to the cheapest feasible type and returns the Score.
-// Distinct-coordinate / in-chip / acyclic properties are guaranteed by the
-// move generators, and the final tree is re-validated with evaluate().
+// Incremental simulated annealing
+//
+// The state is modified in place; each move touches only the affected parents
+// (child count / total length / type) and the affected subtrees (arrival
+// times). Sink arrival times live in a multiset, so Tmax / Tmin are O(1).
+// A rejected move is rolled back from small journals. Removed buffers are only
+// marked dead (ids are never renumbered); the tree is compacted on export.
 // ---------------------------------------------------------------------------
-struct Scratch {
-    std::vector<int> cnt, stk;
-    std::vector<long long> len, arr;
-    std::vector<char> done;
-};
-
-bool fastEval(const Problem& P, Tree& T, Scratch& S, long long& score) {
-    const int n = (int)P.sinks.size();
-    const int m = (int)T.bufs.size();
-    const int N = 1 + n + m;
-    auto pt = [&](int id) -> const Point& {
-        return id == 0 ? P.src : (id <= n ? P.sinks[id - 1] : T.bufs[id - n - 1].p);
-    };
-    S.cnt.assign(N, 0);
-    S.len.assign(N, 0);
-    for (int id = 1; id < N; ++id) {
-        int par = T.parent[id];
-        S.cnt[par]++;
-        S.len[par] += manhattan(pt(par), pt(id));
-    }
-    if (S.cnt[0] > P.srcFanout || S.len[0] > P.srcLength) return false;
-    long long cost = 0;
-    for (int k = 0; k < m; ++k) {
-        int id = n + 1 + k;
-        if (S.cnt[id] == 0) return false;  // unused buffer
-        int t = cheapestType(P, S.cnt[id], S.len[id]);
-        if (t < 0) return false;
-        T.bufs[k].type = t;
-        cost += P.lib[t].cost;
-    }
-    S.arr.assign(N, 0);
-    S.done.assign(N, 0);
-    S.done[0] = 1;
-    for (int id = 1; id < N; ++id) {
-        if (S.done[id]) continue;
-        S.stk.clear();
-        int x = id;
-        while (!S.done[x]) {
-            S.stk.push_back(x);
-            x = T.parent[x];
-            if ((int)S.stk.size() > N) return false;  // cycle guard
-        }
-        while (!S.stk.empty()) {
-            int y = S.stk.back();
-            S.stk.pop_back();
-            int par = T.parent[y];
-            S.arr[y] = S.arr[par] + manhattan(pt(par), pt(y));
-            S.done[y] = 1;
-        }
-    }
-    long long tmax = S.arr[1], tmin = S.arr[1];
-    for (int i = 1; i <= n; ++i) {
-        tmax = std::max(tmax, S.arr[i]);
-        tmin = std::min(tmin, S.arr[i]);
-    }
-    score = cost + (long long)P.wSkew * (tmax - tmin);
-    return true;
-}
-
-// Remove buffers that lost all their children (cascading upwards).
-void pruneEmpty(Tree& T, int n) {
-    for (;;) {
-        int m = (int)T.bufs.size();
-        std::vector<int> cnt(1 + n + m, 0);
-        for (int id = 1; id < 1 + n + m; ++id) cnt[T.parent[id]]++;
-        int victim = -1;
-        for (int k = m - 1; k >= 0; --k)
-            if (cnt[n + 1 + k] == 0) { victim = k; break; }
-        if (victim < 0) return;
-        removeBuffer(T, n, victim);
-    }
-}
-
 typedef unsigned long long u64;
 inline u64 keyOf(Point p) { return ((u64)(unsigned)p.x << 32) | (unsigned)p.y; }
 
-// ---------------------------------------------------------------------------
-// Simulated annealing. Moves: move buffer, reassign a node to another parent,
-// swap the parents of two sinks, insert a buffer above a few siblings, remove
-// a buffer. Only legal candidates are ever accepted; the best legal tree seen
-// is returned.
-// ---------------------------------------------------------------------------
+struct RawTree {  // flat copy of the buffer slots, used for "best so far"
+    std::vector<int> par;
+    std::vector<Point> p;
+    std::vector<int> typ;
+    std::vector<char> alive;
+};
+
+struct IncState {
+    struct Node {
+        Point p;
+        int par = -1;
+        std::vector<int> ch;
+        long long len = 0;
+        long long arr = 0;
+        int typ = -1;
+        bool alive = true;
+    };
+    struct Snap {
+        int id;
+        Point p;
+        int par;
+        std::vector<int> ch;
+        long long len;
+        int typ;
+        bool alive;
+    };
+
+    const Problem& P;
+    int n = 0;
+    std::vector<Node> nd;
+    std::multiset<long long> sinkArr;
+    long long cost = 0;
+    std::unordered_set<u64> occ;
+    std::vector<int> freeList;
+
+    // per-move journals
+    std::vector<Snap> snaps;
+    std::vector<int> stamp;
+    int curStamp = 0;
+    std::vector<std::pair<int, long long>> arrJ;
+    std::vector<int> pendingFree, stk, dirty;
+    std::vector<Point> occAdd, occDel;
+    long long costBefore = 0;
+    int allocated = -1;
+
+    explicit IncState(const Problem& pr) : P(pr), n((int)pr.sinks.size()) {}
+
+    int d(int a, int b) const { return manhattan(nd[a].p, nd[b].p); }
+
+    long long lenOf(int t) const {
+        long long s = 0;
+        for (int c : nd[t].ch) s += d(t, c);
+        return s;
+    }
+
+    bool init(const Tree& T) {
+        const int m = (int)T.bufs.size();
+        const int N = 1 + n + m;
+        nd.assign(N, Node());
+        sinkArr.clear();
+        occ.clear();
+        freeList.clear();
+        cost = 0;
+        nd[0].p = P.src;
+        nd[0].par = -1;
+        for (int i = 1; i <= n; ++i) nd[i].p = P.sinks[i - 1];
+        for (int k = 0; k < m; ++k) nd[n + 1 + k].p = T.bufs[k].p;
+        for (int id = 1; id < N; ++id) {
+            nd[id].par = T.parent[id];
+            nd[T.parent[id]].ch.push_back(id);
+        }
+        for (int t = 0; t < N; ++t) {
+            if (t >= 1 && t <= n) continue;
+            nd[t].len = lenOf(t);
+            if (t == 0) {
+                if ((int)nd[0].ch.size() > P.srcFanout || nd[0].len > P.srcLength) return false;
+                continue;
+            }
+            if (nd[t].ch.empty()) return false;
+            int ty = cheapestType(P, (int)nd[t].ch.size(), nd[t].len);
+            if (ty < 0) return false;
+            nd[t].typ = ty;
+            cost += P.lib[ty].cost;
+        }
+        std::vector<int> st{0};
+        nd[0].arr = 0;
+        while (!st.empty()) {
+            int u = st.back();
+            st.pop_back();
+            for (int c : nd[u].ch) {
+                nd[c].arr = nd[u].arr + d(u, c);
+                st.push_back(c);
+            }
+        }
+        for (int i = 1; i <= n; ++i) sinkArr.insert(nd[i].arr);
+        for (int id = 0; id < N; ++id) occ.insert(keyOf(nd[id].p));
+        stamp.assign(N, 0);
+        curStamp = 0;
+        return true;
+    }
+
+    long long score() const {
+        return cost + (long long)P.wSkew * (*sinkArr.rbegin() - *sinkArr.begin());
+    }
+
+    // ---- journal helpers ----
+    void beginMove() {
+        ++curStamp;
+        snaps.clear();
+        arrJ.clear();
+        pendingFree.clear();
+        occAdd.clear();
+        occDel.clear();
+        costBefore = cost;
+        allocated = -1;
+    }
+    void touch(int id) {
+        if (stamp[id] == curStamp) return;
+        stamp[id] = curStamp;
+        const Node& x = nd[id];
+        snaps.push_back({id, x.p, x.par, x.ch, x.len, x.typ, x.alive});
+    }
+    void setArr(int id, long long v) {
+        arrJ.push_back({id, nd[id].arr});
+        if (id >= 1 && id <= n) {
+            sinkArr.erase(sinkArr.find(nd[id].arr));
+            sinkArr.insert(v);
+        }
+        nd[id].arr = v;
+    }
+    void shiftSubtree(int root, long long delta) {
+        if (delta == 0) return;
+        stk.clear();
+        stk.push_back(root);
+        while (!stk.empty()) {
+            int x = stk.back();
+            stk.pop_back();
+            setArr(x, nd[x].arr + delta);
+            for (int c : nd[x].ch) stk.push_back(c);
+        }
+    }
+    void commit() {
+        for (int id : pendingFree) freeList.push_back(id);
+        for (const Point& q : occDel) occ.erase(keyOf(q));
+        for (const Point& q : occAdd) occ.insert(keyOf(q));
+    }
+    void undo() {
+        for (int i = (int)arrJ.size() - 1; i >= 0; --i) {
+            int id = arrJ[i].first;
+            if (id >= 1 && id <= n) {
+                sinkArr.erase(sinkArr.find(nd[id].arr));
+                sinkArr.insert(arrJ[i].second);
+            }
+            nd[id].arr = arrJ[i].second;
+        }
+        for (Snap& s : snaps) {
+            Node& x = nd[s.id];
+            x.p = s.p; x.par = s.par; x.ch = std::move(s.ch);
+            x.len = s.len; x.typ = s.typ; x.alive = s.alive;
+        }
+        cost = costBefore;
+        if (allocated >= 0) freeList.push_back(allocated);
+    }
+
+    // ---- structure helpers ----
+    void removeChild(int parent, int c) {
+        auto& v = nd[parent].ch;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i] == c) { v[i] = v.back(); v.pop_back(); return; }
+    }
+    void setType(int t, int ty) {
+        if (nd[t].typ >= 0) cost -= P.lib[nd[t].typ].cost;
+        nd[t].typ = ty;
+        if (ty >= 0) cost += P.lib[ty].cost;
+    }
+    bool retype(int t) {
+        if (t == 0) return (int)nd[0].ch.size() <= P.srcFanout && nd[0].len <= P.srcLength;
+        if (nd[t].ch.empty()) return false;
+        int ty = cheapestType(P, (int)nd[t].ch.size(), nd[t].len);
+        if (ty < 0) return false;
+        setType(t, ty);
+        return true;
+    }
+    void kill(int id) {
+        setType(id, -1);
+        nd[id].alive = false;
+        nd[id].ch.clear();
+        pendingFree.push_back(id);
+        occDel.push_back(nd[id].p);
+    }
+    int allocBuffer() {
+        int id;
+        if (!freeList.empty()) { id = freeList.back(); freeList.pop_back(); }
+        else { id = (int)nd.size(); nd.emplace_back(); nd[id].alive = false; stamp.resize(nd.size(), 0); }
+        allocated = id;
+        return id;
+    }
+
+    // ---- moves: each returns false if the result is illegal (caller undoes) ----
+    bool movePos(int b, Point q) {
+        beginMove();
+        int p = nd[b].par;
+        touch(b); touch(p);
+        occDel.push_back(nd[b].p);
+        occAdd.push_back(q);
+        nd[b].p = q;
+        nd[p].len = lenOf(p);
+        nd[b].len = lenOf(b);
+        if (!retype(p) || !retype(b)) return false;
+        long long na = nd[p].arr + d(p, b);
+        for (int c : nd[b].ch) shiftSubtree(c, na + d(b, c) - nd[c].arr);
+        setArr(b, na);
+        return true;
+    }
+
+    bool reassign(int x, int q) {
+        beginMove();
+        int p = nd[x].par;
+        touch(x); touch(p); touch(q);
+        removeChild(p, x);
+        nd[q].ch.push_back(x);
+        nd[x].par = q;
+        nd[p].len = lenOf(p);
+        nd[q].len = lenOf(q);
+        dirty.clear();
+        dirty.push_back(q);
+        int cur = p;
+        for (;;) {
+            if (cur == 0 || !nd[cur].ch.empty()) { dirty.push_back(cur); break; }
+            int gp = nd[cur].par;  // buffer became empty: delete it (cascade)
+            touch(gp);
+            removeChild(gp, cur);
+            nd[gp].len = lenOf(gp);
+            kill(cur);
+            cur = gp;
+        }
+        for (int t : dirty)
+            if (nd[t].alive && !retype(t)) return false;
+        shiftSubtree(x, nd[q].arr + d(q, x) - nd[x].arr);
+        return true;
+    }
+
+    bool swapSinks(int a, int b) {
+        beginMove();
+        int pa = nd[a].par, pb = nd[b].par;
+        touch(a); touch(b); touch(pa); touch(pb);
+        for (int& c : nd[pa].ch) if (c == a) { c = b; break; }
+        for (int& c : nd[pb].ch) if (c == b) { c = a; break; }
+        nd[a].par = pb;
+        nd[b].par = pa;
+        nd[pa].len = lenOf(pa);
+        nd[pb].len = lenOf(pb);
+        if (!retype(pa) || !retype(pb)) return false;
+        setArr(a, nd[pb].arr + d(pb, a));
+        setArr(b, nd[pa].arr + d(pa, b));
+        return true;
+    }
+
+    bool insertBuf(int u, const std::vector<int>& kids, Point pos) {
+        beginMove();
+        int nb = allocBuffer();
+        touch(nb); touch(u);
+        for (int k : kids) touch(k);
+        nd[nb].p = pos;
+        nd[nb].par = u;
+        nd[nb].ch = kids;
+        nd[nb].alive = true;
+        nd[nb].typ = -1;
+        for (int k : kids) { removeChild(u, k); nd[k].par = nb; }
+        nd[u].ch.push_back(nb);
+        nd[nb].len = lenOf(nb);
+        nd[u].len = lenOf(u);
+        occAdd.push_back(pos);
+        if (!retype(nb) || !retype(u)) return false;
+        setArr(nb, nd[u].arr + d(u, nb));
+        for (int k : kids) shiftSubtree(k, nd[nb].arr + d(nb, k) - nd[k].arr);
+        return true;
+    }
+
+    bool removeBuf(int b) {
+        beginMove();
+        int p = nd[b].par;
+        touch(b); touch(p);
+        std::vector<int> kids = nd[b].ch;
+        for (int c : kids) touch(c);
+        removeChild(p, b);
+        for (int c : kids) { nd[c].par = p; nd[p].ch.push_back(c); }
+        nd[p].len = lenOf(p);
+        kill(b);
+        if (!retype(p)) return false;
+        for (int c : kids) shiftSubtree(c, nd[p].arr + d(p, c) - nd[c].arr);
+        return true;
+    }
+
+    // ---- export ----
+    void saveRaw(RawTree& R) const {
+        size_t S = nd.size();
+        R.par.resize(S); R.p.resize(S); R.typ.resize(S); R.alive.resize(S);
+        for (size_t i = 0; i < S; ++i) {
+            R.par[i] = nd[i].par; R.p[i] = nd[i].p; R.typ[i] = nd[i].typ; R.alive[i] = nd[i].alive;
+        }
+    }
+    Tree toTree(const RawTree& R) const {
+        const int S = (int)R.par.size();
+        std::vector<int> nid(S, -1);
+        int m = 0;
+        for (int id = 1; id <= n; ++id) nid[id] = id;
+        for (int id = n + 1; id < S; ++id) if (R.alive[id]) nid[id] = n + 1 + m++;
+        Tree T;
+        T.bufs.resize(m);
+        T.parent.assign(1 + n + m, -1);
+        for (int id = 1; id < S; ++id) {
+            if (id > n && !R.alive[id]) continue;
+            int ni = nid[id];
+            T.parent[ni] = R.par[id] == 0 ? 0 : nid[R.par[id]];
+            if (id > n) T.bufs[ni - n - 1] = {R.typ[id], R.p[id]};
+        }
+        return T;
+    }
+};
+
 void annealing(const Problem& P, Tree& best, long long& bestScore,
                const Clock::time_point& startT, const Clock::time_point& endT) {
     const int n = (int)P.sinks.size();
@@ -409,96 +656,95 @@ void annealing(const Problem& P, Tree& best, long long& bestScore,
     std::mt19937_64 rng(12345);
     auto rnd = [&](int lo, int hi) { return lo + (int)(rng() % (u64)(hi - lo + 1)); };
     auto unif = [&]() { return (double)(rng() >> 11) / 9007199254740992.0; };
+    const bool dbg = std::getenv("CBI_DEBUG") != nullptr;
 
-    Scratch S;
-    Tree cur = best, C;
-    long long curScore = 0;
-    if (!fastEval(P, cur, S, curScore)) return;
+    IncState S(P);
+    if (!S.init(best)) return;
+    long long curScore = S.score();
     bestScore = curScore;
-    best = cur;
-
-    std::unordered_set<u64> occ;
-    auto buildOcc = [&](const Tree& T) {
-        occ.clear();
-        occ.insert(keyOf(P.src));
-        for (auto& s : P.sinks) occ.insert(keyOf(s));
-        for (auto& b : T.bufs) occ.insert(keyOf(b.p));
-    };
-    buildOcc(cur);
+    RawTree bestRaw;
+    S.saveRaw(bestRaw);
 
     const int maxDim = std::max(P.dimX, P.dimY);
     double prog = 0.0;
-    int mvK = -1;
-    Point mvOld, mvNew;
-
     auto inChip = [&](Point q) { return q.x >= 0 && q.x <= P.dimX && q.y >= 0 && q.y <= P.dimY; };
 
-    // returns 0 = no move, 1 = buffer position move, 2 = structural move
-    auto propose = [&](Tree& T) -> int {
-        const int m = (int)T.bufs.size();
-        const int N = 1 + n + m;
+    auto pickBuf = [&]() -> int {
+        int slots = (int)S.nd.size();
+        if (slots <= n + 1) return -1;
+        for (int t = 0; t < 8; ++t) {
+            int id = rnd(n + 1, slots - 1);
+            if (S.nd[id].alive) return id;
+        }
+        return -1;
+    };
+    auto pickParent = [&]() -> int {  // SRC or an alive buffer
+        int slots = (int)S.nd.size();
+        for (int t = 0; t < 8; ++t) {
+            int id = rnd(n, slots - 1);
+            if (id == n) return 0;
+            if (S.nd[id].alive) return id;
+        }
+        return 0;
+    };
+
+    // -1: no move generated, 0: illegal (undo needed), 1: legal and applied
+    auto tryMove = [&]() -> int {
+        const int slots = (int)S.nd.size();
         int r = rnd(0, 99);
-        if (r < 40) {  // move buffer
-            if (m == 0) return 0;
-            int k = rnd(0, m - 1);
-            Point o = T.bufs[k].p;
+        if (r < 40) {  // move a buffer
+            int b = pickBuf();
+            if (b < 0) return -1;
+            Point o = S.nd[b].p;
             int maxStep = std::max(2, (int)(maxDim / 6.0 * (1.0 - prog)));
             int s = (rnd(0, 1) ? rnd(1, 2) : rnd(1, maxStep));
             Point q{o.x + rnd(-s, s), o.y + rnd(-s, s)};
-            if ((q.x == o.x && q.y == o.y) || !inChip(q) || occ.count(keyOf(q))) return 0;
-            T.bufs[k].p = q;
-            mvK = k; mvOld = o; mvNew = q;
-            return 1;
+            if ((q.x == o.x && q.y == o.y) || !inChip(q) || S.occ.count(keyOf(q))) return -1;
+            return S.movePos(b, q) ? 1 : 0;
         }
-        if (r < 65) {  // reassign node x to a (nearby) parent
-            int x = rnd(1, N - 1);
+        if (r < 65) {  // reassign node x to a nearby parent
+            int x = -1;
+            for (int t = 0; t < 8 && x < 0; ++t) {
+                int id = rnd(1, slots - 1);
+                if (id <= n || S.nd[id].alive) x = id;
+            }
+            if (x < 0) return -1;
             int bq = -1, bd = 1 << 30;
             for (int t = 0; t < 6; ++t) {
-                int ri = rnd(0, m);
-                int q = (ri == 0) ? 0 : n + ri;
-                if (q == x || q == T.parent[x]) continue;
+                int q = pickParent();
+                if (q == x || q == S.nd[x].par) continue;
                 if (x > n) {
                     bool bad = false;
-                    for (int y = q; y != 0; y = T.parent[y]) if (y == x) { bad = true; break; }
+                    for (int y = q; y > 0; y = S.nd[y].par) if (y == x) { bad = true; break; }
                     if (bad) continue;
                 }
-                int d = manhattan(nodePoint(P, T, q), nodePoint(P, T, x));
-                if (d < bd) { bd = d; bq = q; }
+                int dd = S.d(q, x);
+                if (dd < bd) { bd = dd; bq = q; }
             }
-            if (bq < 0) return 0;
-            T.parent[x] = bq;
-            pruneEmpty(T, n);
-            return 2;
+            if (bq < 0) return -1;
+            return S.reassign(x, bq) ? 1 : 0;
         }
-        if (r < 80) {  // swap parents of two sinks
+        if (r < 80) {  // swap the parents of two sinks
             int a = rnd(1, n), bb = -1, bd = 1 << 30;
             for (int t = 0; t < 6; ++t) {
                 int b = rnd(1, n);
-                if (b == a || T.parent[b] == T.parent[a]) continue;
-                int d = manhattan(P.sinks[a - 1], P.sinks[b - 1]);
-                if (d < bd) { bd = d; bb = b; }
+                if (b == a || S.nd[b].par == S.nd[a].par) continue;
+                int dd = S.d(a, b);
+                if (dd < bd) { bd = dd; bb = b; }
             }
-            if (bb < 0) return 0;
-            std::swap(T.parent[a], T.parent[bb]);
-            return 2;
+            if (bb < 0) return -1;
+            return S.swapSinks(a, bb) ? 1 : 0;
         }
-        if (r < 90) {  // insert a buffer above 2-3 sibling nodes
-            int ri = rnd(0, m);
-            int u = (ri == 0) ? 0 : n + ri;
-            std::vector<int> kids;
-            for (int id = 1; id < N; ++id) if (T.parent[id] == u) kids.push_back(id);
-            if (kids.size() < 2) return 0;
+        if (r < 90) {  // insert a buffer above 2-3 siblings
+            int u = pickParent();
+            std::vector<int> kids = S.nd[u].ch;
+            if (kids.size() < 2) return -1;
             int a = kids[rnd(0, (int)kids.size() - 1)];
-            std::sort(kids.begin(), kids.end(), [&](int x, int y) {
-                return manhattan(nodePoint(P, T, a), nodePoint(P, T, x)) <
-                       manhattan(nodePoint(P, T, a), nodePoint(P, T, y));
-            });
-            int g = std::min<int>(kids.size(), rnd(2, 3));
+            std::sort(kids.begin(), kids.end(), [&](int x, int y) { return S.d(a, x) < S.d(a, y); });
+            int g = std::min<int>((int)kids.size(), rnd(2, 3));
+            kids.resize(g);
             std::vector<int> xs, ys;
-            for (int i = 0; i < g; ++i) {
-                Point q = nodePoint(P, T, kids[i]);
-                xs.push_back(q.x); ys.push_back(q.y);
-            }
+            for (int k : kids) { xs.push_back(S.nd[k].p.x); ys.push_back(S.nd[k].p.y); }
             std::sort(xs.begin(), xs.end());
             std::sort(ys.begin(), ys.end());
             Point want{xs[g / 2], ys[g / 2]}, pos;
@@ -506,34 +752,30 @@ void annealing(const Problem& P, Tree& best, long long& bestScore,
             for (int rr = 0; rr <= 4 && !found; ++rr)
                 for (int dx = -rr; dx <= rr && !found; ++dx) {
                     int rem = rr - std::abs(dx);
-                    for (int s = 0; s < 2 && !found; ++s) {
-                        if (s == 1 && rem == 0) continue;
-                        Point c{want.x + dx, want.y + (s ? -rem : rem)};
-                        if (inChip(c) && !occ.count(keyOf(c))) { pos = c; found = true; }
+                    for (int sg = 0; sg < 2 && !found; ++sg) {
+                        if (sg == 1 && rem == 0) continue;
+                        Point c{want.x + dx, want.y + (sg ? -rem : rem)};
+                        if (inChip(c) && !S.occ.count(keyOf(c))) { pos = c; found = true; }
                     }
                 }
-            if (!found) return 0;
-            T.bufs.push_back({0, pos});
-            int id = n + 1 + m;
-            T.parent.push_back(u);
-            for (int i = 0; i < g; ++i) T.parent[kids[i]] = id;
-            return 2;
+            if (!found) return -1;
+            return S.insertBuf(u, kids, pos) ? 1 : 0;
         }
-        // remove a buffer
-        if (m == 0) return 0;
-        removeBuffer(T, n, rnd(0, m - 1));
-        return 2;
+        int b = pickBuf();  // remove a buffer
+        if (b < 0) return -1;
+        return S.removeBuf(b) ? 1 : 0;
     };
 
     // Calibrate the starting temperature from typical |delta| of legal moves.
     double sum = 0; int cntD = 0;
-    for (int tries = 0; tries < 2000 && cntD < 300; ++tries) {
-        C = cur;
-        if (!propose(C)) continue;
-        long long sc;
-        if (!fastEval(P, C, S, sc)) continue;
-        long long d = sc - curScore;
-        if (d != 0) { sum += (double)std::llabs(d); ++cntD; }
+    for (int tries = 0; tries < 3000 && cntD < 300; ++tries) {
+        int k = tryMove();
+        if (k < 0) continue;
+        if (k == 1) {
+            long long d = S.score() - curScore;
+            if (d != 0) { sum += (double)std::llabs(d); ++cntD; }
+        }
+        S.undo();
     }
     const double T0 = cntD ? std::max(1.0, sum / cntD) : 1.0;
     const double Tend = std::max(0.05, T0 * 0.01);
@@ -549,23 +791,34 @@ void annealing(const Problem& P, Tree& best, long long& bestScore,
             if (prog >= 1.0) break;
             temp = T0 * std::pow(Tend / T0, prog);
         }
-        C = cur;
-        int kind = propose(C);
-        if (!kind) continue;
-        long long sc;
-        if (!fastEval(P, C, S, sc)) continue;
+        int k = tryMove();
+        if (k < 0) continue;
+        if (k == 0) { S.undo(); continue; }
+        long long sc = S.score();
         long long d = sc - curScore;
         if (d <= 0 || unif() < std::exp(-(double)d / temp)) {
-            cur = C;
+            S.commit();
             curScore = sc;
-            if (kind == 1) { occ.erase(keyOf(mvOld)); occ.insert(keyOf(mvNew)); }
-            else buildOcc(cur);
-            if (curScore < bestScore) { bestScore = curScore; best = cur; sinceBest = 0; }
+            if (curScore < bestScore) { bestScore = curScore; S.saveRaw(bestRaw); sinceBest = 0; }
+            if (dbg && (it % 997) == 0) {  // cross-check against the full evaluator
+                RawTree R; S.saveRaw(R);
+                EvalResult e = evaluate(P, S.toTree(R));
+                if (!e.legal || e.score != curScore) {
+                    std::fprintf(stderr, "DEBUG MISMATCH at iter %lld: incremental=%lld full=%lld legal=%d (%s)\n",
+                                 it, curScore, e.score, (int)e.legal, e.msg.c_str());
+                    std::abort();
+                }
+            }
+        } else {
+            S.undo();
         }
-        if (++sinceBest > 200000) {  // restart from the best solution
-            cur = best; curScore = bestScore; buildOcc(cur); sinceBest = 0;
+        if (++sinceBest > 400000 && prog > 0.5) {  // late phase: restart from the best
+            Tree bt = S.toTree(bestRaw);
+            if (S.init(bt)) { curScore = S.score(); }
+            sinceBest = 0;
         }
     }
+    best = S.toTree(bestRaw);
 }
 
 }  // namespace
@@ -631,7 +884,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
     auto at = [&](double f) { return t0 + std::chrono::milliseconds((long long)(timeLimitSec * f * 1000)); };
     Tree T = bestTree;
     {
-        const auto dl = at(0.25);
+        const auto dl = at(n <= 2000 ? 0.25 : 0.03);
         bool improved = true;
         while (improved && !timeUp(dl)) {
             improved = false;
@@ -654,7 +907,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
     // Stage 2c: final greedy polish with the remaining time.
     {
         bool improved = true;
-        while (improved && !timeUp(deadline)) {
+        while (n <= 2000 && improved && !timeUp(deadline)) {
             improved = false;
             if (removalPass(P, T, best, deadline)) improved = true;
             if (movePass(P, T, best, deadline)) improved = true;
