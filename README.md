@@ -51,11 +51,3 @@ make
 
 **時間預算**:預設 40 秒(限制為 60 秒),以實際經過時間計算。可用環境變數 `CBI_TIME=秒數` 覆寫,方便實驗。小測資會因迭代次數上限提早結束。
 
-## 輔助腳本(繳交時不需要)
-```sh
-python3 scripts/gen_random.py N SEED W_SKEW > inputs/input002.cbi   # 產生隨機測資
-python3 scripts/gen_extreme.py CASE N SEED > x.cbi                    # 極端測資(tinysrc/srcf1/shortlib/dense/normal/big)
-python3 scripts/check.py input.cbi output.cbi                       # 獨立檢查器
-sh scripts/run_all.sh                                               # 編譯、批次執行並驗證
-sh scripts/make_submit.sh B11215061                                 # 產生繳交用 zip
-```

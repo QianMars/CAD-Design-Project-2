@@ -833,6 +833,11 @@ void annealing(const Problem& P, Tree& best, long long& bestScore,
 
 SolveOutput solve(const Problem& P, double timeLimitSec) {
     const auto deadline = Clock::now() + std::chrono::milliseconds((long long)(timeLimitSec * 1000));
+    const auto tBegin = Clock::now();
+    auto mark = [&](const char* what) {
+        if (std::getenv("CBI_VERBOSE"))
+            std::fprintf(stderr, "[t=%6.1fs] %s\n", std::chrono::duration<double>(Clock::now() - tBegin).count(), what);
+    };
     const int n = (int)P.sinks.size();
     SolveOutput out;
     bool have = false;
@@ -885,6 +890,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
         out.ok = false;
         return out;
     }
+    mark("stage 1 done (initial legal solution)");
     out.stages.push_back({"initial (best legal candidate)", best});
     out.initTree = bestTree;
 
@@ -901,6 +907,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
             if (movePass(P, T, best, dl)) improved = true;
         }
         out.stages.push_back({"after greedy local search", evaluate(P, T)});
+        mark("greedy local search done");
     }
 
     // Stage 2b: simulated annealing (reassign / swap / insert / remove / move).
@@ -911,6 +918,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
         EvalResult r = evaluate(P, A);
         if (r.legal && r.score <= best.score) { T = A; best = r; }
         out.stages.push_back({"after simulated annealing", evaluate(P, T)});
+        mark("simulated annealing done");
     }
 
     // Stage 2c: final greedy polish with the remaining time.
@@ -922,6 +930,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
             if (movePass(P, T, best, deadline)) improved = true;
         }
         out.stages.push_back({"after final polish", evaluate(P, T)});
+        mark("final polish done");
     }
     out.tree = T;
     out.res = evaluate(P, T);
