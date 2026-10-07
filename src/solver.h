@@ -13,6 +13,7 @@ struct Stage {
 struct SolveOutput {
     bool ok = false;
     Tree tree;
+    Tree initTree;  // best legal tree before optimisation (for plots / report)
     EvalResult res;
     std::vector<Stage> stages;  // for the report: skew / cost / score per stage
 };

@@ -657,6 +657,11 @@ void annealing(const Problem& P, Tree& best, long long& bestScore,
     auto rnd = [&](int lo, int hi) { return lo + (int)(rng() % (u64)(hi - lo + 1)); };
     auto unif = [&]() { return (double)(rng() >> 11) / 9007199254740992.0; };
     const bool dbg = std::getenv("CBI_DEBUG") != nullptr;
+    // Experiment switches: CBI_NOMOVE=pos,reassign,swap,insert,remove (comma list) disables moves.
+    const std::string nomove = std::getenv("CBI_NOMOVE") ? std::getenv("CBI_NOMOVE") : "";
+    auto off = [&](const char* k) { return nomove.find(k) != std::string::npos; };
+    const bool offPos = off("pos"), offRe = off("reassign"), offSwap = off("swap"),
+               offIns = off("insert"), offRem = off("remove");
 
     IncState S(P);
     if (!S.init(best)) return;
@@ -692,6 +697,9 @@ void annealing(const Problem& P, Tree& best, long long& bestScore,
     auto tryMove = [&]() -> int {
         const int slots = (int)S.nd.size();
         int r = rnd(0, 99);
+        if ((r < 40 && offPos) || (r >= 40 && r < 65 && offRe) || (r >= 65 && r < 80 && offSwap) ||
+            (r >= 80 && r < 90 && offIns) || (r >= 90 && offRem))
+            return -1;
         if (r < 40) {  // move a buffer
             int b = pickBuf();
             if (b < 0) return -1;
@@ -878,6 +886,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
         return out;
     }
     out.stages.push_back({"initial (best legal candidate)", best});
+    out.initTree = bestTree;
 
     // Stage 2a: greedy local search (time-boxed).
     const auto t0 = Clock::now();
@@ -898,7 +907,7 @@ SolveOutput solve(const Problem& P, double timeLimitSec) {
     {
         Tree A = T;
         long long sc = best.score;
-        annealing(P, A, sc, Clock::now(), at(0.92));
+        if (!std::getenv("CBI_NOSA")) annealing(P, A, sc, Clock::now(), at(0.92));
         EvalResult r = evaluate(P, A);
         if (r.legal && r.score <= best.score) { T = A; best = r; }
         out.stages.push_back({"after simulated annealing", evaluate(P, T)});

@@ -52,6 +52,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (const char* ip = std::getenv("CBI_INIT_OUT")) {  // dump the initial legal tree (for figures)
+        std::string e2;
+        writeTree(ip, P, S.initTree, e2);
+    }
     if (std::getenv("CBI_VERBOSE")) {
         for (const auto& s : S.stages) {
             if (s.res.legal)
